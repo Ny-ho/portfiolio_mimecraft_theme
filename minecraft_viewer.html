@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Minecraft World Viewer</title>
+
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+
+    /* The Three.js canvas — pixelated so block textures stay sharp */
+    canvas {
+      display: block;
+      width: 100vw !important;
+      height: 100vh !important;
+      image-rendering: pixelated;   /* Chrome / Firefox / Edge */
+      image-rendering: crisp-edges; /* Safari fallback          */
+    }
+
+    /* ── Loading screen ─────────────────────────────────────────── */
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #1a1a2e;
+      z-index: 20;
+      font-family: "Courier New", monospace;
+      color: #5dfc82;
+      font-size: 1.4rem;
+      letter-spacing: 0.08em;
+      transition: opacity 0.6s ease;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+
+    /* ── Click-to-start overlay ─────────────────────────────────── */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.72);
+      z-index: 10;
+      font-family: "Courier New", monospace;
+      color: #ffffff;
+      text-align: center;
+      cursor: pointer;
+      user-select: none;
+    }
+    #overlay h2 {
+      font-size: 2rem;
+      margin-bottom: 0.75rem;
+      color: #5dfc82;
+      text-shadow: 0 0 12px #5dfc8280;
+    }
+    #overlay p  { font-size: 1rem; opacity: 0.75; }
+    #overlay small { margin-top: 0.5rem; font-size: 0.8rem; opacity: 0.45; }
+
+    /* ── First-person crosshair ─────────────────────────────────── */
+    #crosshair {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 22px;
+      height: 22px;
+      pointer-events: none;
+      display: none;
+    }
+    #crosshair::before, #crosshair::after {
+      content: '';
+      position: absolute;
+      background: rgba(255,255,255,0.85);
+    }
+    #crosshair::before { width: 2px; height: 100%; left: 50%; transform: translateX(-50%); }
+    #crosshair::after  { height: 2px; width: 100%; top: 50%;  transform: translateY(-50%); }
+  </style>
+</head>
+<body>
+
+  <div id="loading">▌ Loading World…</div>
+  <div id="overlay">
+    <h2>🌍 Minecraft World</h2>
+    <p>Click anywhere to enter first-person view</p>
+    <small>ESC to release mouse · scroll to zoom</small>
+  </div>
+  <div id="crosshair"></div>
+
+  <!-- Three.js import map (no build step needed) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three":          "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+      "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { GLTFLoader }   from 'three/addons/loaders/GLTFLoader.js';
+  import { RGBELoader }   from 'three/addons/loaders/RGBELoader.js';
+  import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+  import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+  import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  RENDERER
+  // ═══════════════════════════════════════════════════════════════════
+  const renderer = new THREE.WebGLRenderer({ antialias: false }); // antialias OFF → sharp pixels
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled  = true;
+  renderer.toneMapping        = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.25;
+  renderer.domElement.style.imageRendering = 'pixelated'; // belt-and-suspenders
+  document.body.appendChild(renderer.domElement);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  SCENE & BACKGROUND
+  // ═══════════════════════════════════════════════════════════════════
+  const scene = new THREE.Scene();
+
+  // Load Starry Night HDRI
+  new RGBELoader().load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/equirectangular/moonless_golf_1k.hdr', (texture) => {
+    texture.mapping = THREE.EquirectangularReflectionMapping;
+    scene.background = texture;
+    scene.environment = texture;
+    scene.environmentIntensity = 0.3; // Starlight subtly reflects off grass
+  });
+  
+  // Initial fog (will be adjusted when model loads)
+  scene.fog = new THREE.Fog(0x0a0b1e, 1, 10);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  CAMERA  ← starting position is YOUR coordinates
+  // ═══════════════════════════════════════════════════════════════════
+  const camera = new THREE.PerspectiveCamera(
+    75,                                        // field of view (degrees)
+    window.innerWidth / window.innerHeight,    // aspect ratio
+    0.001,                                     // near clip  (keep small for tiny scenes)
+    2000                                       // far  clip
+  );
+
+  // ── YOUR CAMERA POSITION ──────────────────────────────────────────
+  //    Change these three numbers to move the starting viewpoint.
+  camera.position.set(
+    0.314,   // ← X
+    0.210,   // ← Y
+    -0.180   // ← Z
+  );
+  camera.rotation.order = 'YXZ'; // yaw first, then pitch (standard FPS)
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  POST-PROCESSING (BLOOM)
+  // ═══════════════════════════════════════════════════════════════════
+  const composer = new EffectComposer(renderer);
+  const renderPass = new RenderPass(scene, camera);
+  composer.addPass(renderPass);
+
+  // BloomPass: resolution, strength, radius, threshold
+  // Threshold is high (0.85) so only extremely bright things (like our text) glow
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+  composer.addPass(bloomPass);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  LIGHTING  (High-Contrast Cinematic Night)
+  // ═══════════════════════════════════════════════════════════════════
+  // 1. Ambient – kept very low for deep shadows
+  scene.add(new THREE.AmbientLight(0xffffff, 0.2));
+
+  // 2. Moonlight – directional light with shadows
+  const moon = new THREE.DirectionalLight(0x88bbff, 1.5);
+  moon.position.set(50, 80, 30);
+  moon.castShadow = true;
+  moon.shadow.mapSize.set(2048, 2048);
+  scene.add(moon);
+
+  // 3. Hemisphere – very subtle night sky/ground blend
+  scene.add(new THREE.HemisphereLight(0x0a0b1e, 0x050510, 0.3));
+
+  // 4. Torch/Pumpkin Light – Warm orange glow
+  // ⚠️ IMPORTANT: I do not know where your pumpkins are! 
+  // You MUST change these X, Y, Z coordinates to place it exactly on the pumpkins.
+  const pumpkinLight = new THREE.PointLight(0xff8800, 0.8, 0.5); // reduced intensity (0.8) and distance (0.5)
+  pumpkinLight.position.set(0.8, 0.18, -0.8); // Moved further away so it doesn't blind you
+  scene.add(pumpkinLight);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  LOAD GLB MODEL
+  // ═══════════════════════════════════════════════════════════════════
+  const loadingEl = document.getElementById('loading');
+
+  new GLTFLoader().load(
+    'minecraft_world.glb',
+
+    // ── onLoad ────────────────────────────────────────────────────
+    (gltf) => {
+      gltf.scene.traverse((child) => {
+        if (!child.isMesh) return;
+        child.castShadow    = true;
+        child.receiveShadow = true;
+
+        // Apply NEAREST-NEIGHBOR filter to every texture map
+        // This keeps Minecraft blocks sharp & pixelated, not blurry
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        mats.forEach((mat) => {
+          ['map','normalMap','roughnessMap','metalnessMap','emissiveMap','aoMap','alphaMap'].forEach((key) => {
+            if (mat[key]) {
+              mat[key].minFilter = THREE.NearestFilter;
+              mat[key].magFilter = THREE.NearestFilter;
+              mat[key].needsUpdate = true;
+            }
+          });
+          
+          // Boost emissive materials (e.g. lava, torches, glowing eyes) so they trigger the Bloom effect
+          if (mat.emissiveMap || (mat.emissive && (mat.emissive.r > 0 || mat.emissive.g > 0 || mat.emissive.b > 0))) {
+            mat.emissiveIntensity = 4.0; // Multiplies the glow to exceed bloom threshold
+          }
+        });
+      });
+
+      // ── Dynamically Set Fog Based on Model Size ──
+      const box = new THREE.Box3().setFromObject(gltf.scene);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      
+      const radius = size.length() / 2;
+      scene.fog.near = radius * 0.50; // Fog start at 50% of radius
+      scene.fog.far  = radius * 0.95; // Fog end at 95% of radius
+
+      scene.add(gltf.scene);
+      loadingEl.classList.add('hidden');
+    },
+
+    // ── onProgress ────────────────────────────────────────────────
+    (xhr) => {
+      if (xhr.total) {
+        const pct = Math.round((xhr.loaded / xhr.total) * 100);
+        loadingEl.textContent = `▌ Loading World… ${pct}%`;
+      }
+    },
+
+    // ── onError ───────────────────────────────────────────────────
+    (err) => {
+      loadingEl.textContent = '✖ Could not load minecraft_world.glb – check the file name and location.';
+      console.error(err);
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  FIRST-PERSON MOUSE LOOK  (Pointer Lock API)
+  // ═══════════════════════════════════════════════════════════════════
+  const overlay   = document.getElementById('overlay');
+  const crosshair = document.getElementById('crosshair');
+
+  let yaw   = 0;  // horizontal look (Y axis rotation)
+  let pitch = 0;  // vertical look   (X axis rotation)
+  const MAX_PITCH = Math.PI / 2 - 0.01; // prevent flipping
+
+  // Click anywhere to request pointer lock
+  [overlay, renderer.domElement].forEach((el) => {
+    el.addEventListener('click', () => renderer.domElement.requestPointerLock());
+  });
+
+  // Show/hide UI based on lock state
+  document.addEventListener('pointerlockchange', () => {
+    const locked = document.pointerLockElement === renderer.domElement;
+    overlay.style.display   = locked ? 'none'  : 'flex';
+    crosshair.style.display = locked ? 'block' : 'none';
+  });
+
+  // Mouse movement → rotate camera
+  document.addEventListener('mousemove', (e) => {
+    if (document.pointerLockElement !== renderer.domElement) return;
+
+    const sensitivity = 0.0018; // lower = slower turn, raise for faster
+    yaw   -= e.movementX * sensitivity;
+    pitch -= e.movementY * sensitivity;
+    pitch  = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, pitch));
+
+    camera.rotation.y = yaw;
+    camera.rotation.x = pitch;
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  YOUTUBE HOTSPOT
+  // ═══════════════════════════════════════════════════════════════════
+  function createTextTexture(text) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 256;
+    canvas.height = 64;
+    
+    // Text (White, Monospaced)
+    ctx.font = 'bold 42px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+    return texture;
+  }
+
+  const hotspotPos = new THREE.Vector3(0.403, 0.158, -0.178); // Shifted slightly right (Z from -0.182 to -0.172)
+  const hotspotGeo = new THREE.PlaneGeometry(0.03, 0.009); // Scaled down further
+  const hotspotMat = new THREE.MeshBasicMaterial({ 
+    map: createTextTexture('PROJECTS'),
+    color: new THREE.Color(1.0, 1.0, 1.0), // Normal color so it does NOT glow
+    transparent: true,
+    side: THREE.DoubleSide 
+  });
+  
+  const hotspot = new THREE.Mesh(hotspotGeo, hotspotMat);
+  hotspot.position.copy(hotspotPos);
+  
+  // Rotate -90 degrees (fixes the mirroring)
+  hotspot.rotation.y = -Math.PI / 2; 
+  
+  // Offset slightly so it doesn't z-fight with the block face
+  // (Direction changed to +X because we flipped the rotation)
+  hotspot.position.x += 0.001; 
+  
+  scene.add(hotspot);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  INTERACTION (Raycaster)
+  // ═══════════════════════════════════════════════════════════════════
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2(0, 0); // Center of screen for pointer lock
+
+  document.addEventListener('mousedown', (e) => {
+    if (document.pointerLockElement !== renderer.domElement) return;
+    
+    // Update raycaster from camera
+    raycaster.setFromCamera(mouse, camera);
+    
+    // Check for hits
+    const intersects = raycaster.intersectObject(hotspot);
+    
+    if (intersects.length > 0) {
+      window.open('https://www.youtube.com', '_blank');
+    }
+  });
+
+  // Highlight effect on hover
+  function checkHover() {
+    if (document.pointerLockElement !== renderer.domElement) {
+      hotspot.material.color.setRGB(1.0, 1.0, 1.0);
+      return;
+    }
+    
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(hotspot);
+    
+    if (intersects.length > 0) {
+      hotspot.material.color.setRGB(0.3, 1.0, 0.5); // Normal green highlight
+      document.body.style.cursor = 'pointer';
+    } else {
+      hotspot.material.color.setRGB(1.0, 1.0, 1.0); // Normal White
+      document.body.style.cursor = 'default';
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  RESIZE
+  // ═══════════════════════════════════════════════════════════════════
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  RENDER LOOP
+  // ═══════════════════════════════════════════════════════════════════
+  (function animate() {
+    requestAnimationFrame(animate);
+    checkHover();
+    composer.render();
+  })();
+  </script>
+
+</body>
+</html>
